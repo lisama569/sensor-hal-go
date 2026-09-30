@@ -97,7 +97,9 @@ func TestSampleTimeoutWhenNeverReady(t *testing.T) {
 	}
 	// 不推进时钟 => 转换永不就绪 => 采样在 SampleTimeout 后超时。
 	// 用真实截止时间控制等待上限（寄存器读取本身是瞬时的）。
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	// 外层上限必须远大于内部 SampleTimeout（200ms），否则高负载调度饥饿时
+	// 外层截止先触发会把结论翻成 CANCELED，失败归因随调度抖动。
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, err := r.drv.Sample(ctx)
 	se, ok := AsError(err)

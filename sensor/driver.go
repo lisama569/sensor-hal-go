@@ -404,7 +404,7 @@ func (d *Driver) Sample(ctx context.Context) (Sample, error) {
 	for {
 		status, e := d.readRetry(dctx, "sample", AddrStatus)
 		if e != nil {
-			return Sample{}, e
+			return Sample{}, d.sampleWindowErr(ctx, e)
 		}
 		if status&StatusDRDY != 0 {
 			q := QOK
@@ -416,7 +416,7 @@ func (d *Driver) Sample(ctx context.Context) (Sample, error) {
 			}
 			values, e := d.burstRetry(dctx, "sample", AddrDataX, 3)
 			if e != nil {
-				return Sample{}, e
+				return Sample{}, d.sampleWindowErr(ctx, e)
 			}
 			s := Sample{
 				T:       d.now(),
@@ -450,6 +450,32 @@ func sleepWait(ctx context.Context, d time.Duration) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// sampleWindowErr 归一化采样就绪窗口内读事务的终态错误：
+//   - 外层调用方 ctx 已结束（主动取消 / 调用方自己的截止）=> KindCanceled；
+//   - 否则只要是内部采样截止窗口到点（即便截止恰好打断一次读事务，
+//     readRetry 会把 DeadlineExceeded 报成 KindCanceled），一律归因为
+//     KindTimeout（设备在窗口内一直未就绪）。
+//
+// 这样同一设备行为下结论不随截止时间与总线事务的调度先后而变化。
+func (d *Driver) sampleWindowErr(caller context.Context, e *Error) *Error {
+	if caller.Err() != nil {
+		if e.Kind == KindCanceled {
+			return e
+		}
+		ne := *e
+		ne.Kind = KindCanceled
+		ne.Detail = "canceled while sample: " + caller.Err().Error()
+		return &ne
+	}
+	if e.Kind == KindCanceled {
+		ne := *e
+		ne.Kind = KindTimeout
+		ne.Detail = "data not ready within sample timeout"
+		return &ne
+	}
+	return e
 }
 
 // Suspend 挂起设备：写挂起位并保留配置。ACTIVE 以外状态调用立即报错。
