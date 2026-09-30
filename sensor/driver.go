@@ -404,7 +404,7 @@ func (d *Driver) Sample(ctx context.Context) (Sample, error) {
 	for {
 		status, e := d.readRetry(dctx, "sample", AddrStatus)
 		if e != nil {
-			return Sample{}, e
+			return Sample{}, classifySampleEnd(ctx, dctx, e)
 		}
 		if status&StatusDRDY != 0 {
 			q := QOK
@@ -416,7 +416,7 @@ func (d *Driver) Sample(ctx context.Context) (Sample, error) {
 			}
 			values, e := d.burstRetry(dctx, "sample", AddrDataX, 3)
 			if e != nil {
-				return Sample{}, e
+				return Sample{}, classifySampleEnd(ctx, dctx, e)
 			}
 			s := Sample{
 				T:       d.now(),
@@ -438,6 +438,23 @@ func (d *Driver) Sample(ctx context.Context) (Sample, error) {
 			return Sample{}, fail(KindTimeout, "sample", "data not ready within sample timeout", 0)
 		}
 	}
+}
+
+// classifySampleEnd 在采样路径返回错误时区分两种"等不下去"的情况，
+// 使同一设备/总线行为反复运行得到同一结论，与截止点恰好落在轮询休眠
+// 还是在途事务中无关：
+//   - 仅采样窗口 dctx 到期（调用方 ctx 仍有效）：设备在窗口内一直没准备好，
+//     归一化为 KindTimeout；
+//   - 调用方 ctx 结束（含被 Suspend 取消）：归一化为 KindCanceled；
+//   - 其余根因（拒绝、不兼容等）原样返回，不改写。
+func classifySampleEnd(parent, deadline context.Context, e *Error) *Error {
+	if e.Kind == KindCanceled && parent.Err() == nil && deadline.Err() != nil {
+		ne := *e
+		ne.Kind = KindTimeout
+		ne.Detail = "data not ready within sample timeout"
+		return &ne
+	}
+	return e
 }
 
 // sleepWait 在 ctx 上休眠等待 d（非忙等）。
