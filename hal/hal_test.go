@@ -154,13 +154,16 @@ func TestSuspendIdempotentAndInFlightAbort(t *testing.T) {
 	if d := time.Since(start); d > 250*time.Millisecond {
 		t.Fatalf("suspend blocked for %v while read in flight", d)
 	}
-	cancel()
+	// 采样是被设备侧挂起打断的（不是调用方主动取消）：结论必须稳定为
+	// SUSPENDED。即便测试随后取消 rctx，也不得翻成 CANCELED——
+	// 设备侧中断与调用方主动结束必须可分，且不随调度先后漂移。
 	select {
 	case err := <-readErr:
-		mustCode(t, err, CodeCanceled)
+		mustCode(t, err, CodeSuspended)
 	case <-time.After(time.Second):
 		t.Fatal("in-flight read never returned")
 	}
+	cancel()
 
 	// 再次挂起是幂等无操作；清除故障后恢复设备。
 	if err := h.Suspend(ctx); err != nil {
@@ -325,7 +328,9 @@ func TestStreamStopsOnSuspend(t *testing.T) {
 	case <-deadline:
 		t.Fatal("stream did not terminate on suspend")
 	}
-	mustCode(t, finalErr, CodeCanceled)
+	// 流在挂起后吐出的终态错误必须是设备侧结论 SUSPENDED，
+	// 而不是“调用方主动结束”CANCELED（流的 ctx 自始至终存活）。
+	mustCode(t, finalErr, CodeSuspended)
 	_, ok := <-ch
 	if ok {
 		t.Fatal("stream channel must close after terminal error")

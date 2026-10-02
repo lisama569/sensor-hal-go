@@ -93,7 +93,9 @@ type StreamItem struct {
 //   - pmu 串行化电源状态切换；
 //   - sampleGate 是容量为 1 的令牌，保证同一时刻只有一个采样事务在途，
 //     获取令牌可被 ctx 取消，因此 Suspend 不会被在途采样无限阻塞；
-//   - activeCancel 用于让 Suspend 主动取消在途采样，使挂起立即生效；
+//   - active 指向当前在途采样的票据；Suspend/Shutdown 在票据上记下
+//     “设备侧中断原因”后再取消采样，使设备侧中断与调用方主动取消
+//     在任何调度时机都得到稳定可分的错误码；
 //   - 采样路径不持有自旋锁轮询硬件，等待数据就绪时休眠，不存在忙等。
 type HAL struct {
 	drv *sensor.Driver
@@ -101,8 +103,19 @@ type HAL struct {
 	pmu        sync.Mutex
 	sampleGate chan struct{}
 
-	mu           sync.Mutex
-	activeCancel context.CancelFunc
+	mu     sync.Mutex
+	active *inflightSample
+}
+
+// inflightSample 是一次在途采样的票据：电源切换在 cancel 之前先写入
+// abortCode，因此被打断的采样醒来后能看到确定的设备侧归因。
+//
+// 内存顺序：abortCode 写入发生在 cancel() 调用之前，而采样 goroutine
+// 观察到内部 ctx 结束必然发生在 cancel() 之后，故其随后读取 abortCode
+// 无需额外同步即可看到该写入。
+type inflightSample struct {
+	cancel    context.CancelFunc
+	abortCode Code // 0 表示尚未被设备侧电源切换打断
 }
 
 // New 基于已构造的驱动创建 HAL。
@@ -125,34 +138,39 @@ func (h *HAL) acquireSample(ctx context.Context) error {
 
 func (h *HAL) releaseSample() { <-h.sampleGate }
 
-// registerActive 登记一个可被电源切换取消的采样上下文，返回其 cancel。
-func (h *HAL) registerActive() (context.Context, context.CancelFunc) {
+// registerActive 登记一个可被电源切换取消的采样上下文，返回其上下文与票据。
+// 票据由所属的 Read 独占持有；HAL 侧只保留一个指针用于电源切换时通知。
+func (h *HAL) registerActive() (context.Context, *inflightSample) {
 	ctx, cancel := context.WithCancel(context.Background())
+	tok := &inflightSample{cancel: cancel}
 	h.mu.Lock()
-	h.activeCancel = cancel
+	h.active = tok
 	h.mu.Unlock()
-	return ctx, cancel
+	return ctx, tok
 }
 
-// clearActive 注销（仅当登记的仍是自己）并取消上下文。
-func (h *HAL) clearActive(cancel context.CancelFunc) {
+// clearActive 注销本次在途采样（仅当登记的仍是自己的票据），
+// 并取消桥接上下文。
+func (h *HAL) clearActive(tok *inflightSample) {
 	h.mu.Lock()
-	if h.activeCancel != nil {
-		// 无法比较函数指针身份时也只需清空：后来者会覆盖此字段。
-		h.activeCancel = nil
+	if h.active == tok {
+		h.active = nil
 	}
 	h.mu.Unlock()
-	cancel()
+	tok.cancel()
 }
 
-// abortActive 取消在途采样（若有）。
-func (h *HAL) abortActive() {
+// abortActive 以设备侧原因 code 打断在途采样（若有）：先在票据上记下
+// 归因，再取消其内部上下文。被打断的采样据此得到稳定的设备侧错误码，
+// 不会被误报为调用方主动结束。
+func (h *HAL) abortActive(code Code) {
 	h.mu.Lock()
-	c := h.activeCancel
-	h.activeCancel = nil
+	tok := h.active
+	h.active = nil
 	h.mu.Unlock()
-	if c != nil {
-		c()
+	if tok != nil {
+		tok.abortCode = code
+		tok.cancel()
 	}
 }
 
@@ -171,8 +189,8 @@ func (h *HAL) Read(ctx context.Context) (Sample, error) {
 	}
 	defer h.releaseSample()
 
-	active, activeCancel := h.registerActive()
-	defer h.clearActive(activeCancel)
+	active, tok := h.registerActive()
+	defer h.clearActive(tok)
 
 	// 驱动采样在 (调用方 ctx ∪ 电源切换取消) 任一触发时结束。
 	cctx, cancel := context.WithCancel(ctx)
@@ -187,9 +205,32 @@ func (h *HAL) Read(ctx context.Context) (Sample, error) {
 
 	s, err := h.drv.Sample(cctx)
 	if err != nil {
-		return Sample{}, mapErr("sample", err)
+		return Sample{}, h.mapSampleErr(ctx, tok, err)
 	}
 	return s, nil
+}
+
+// mapSampleErr 归一化采样错误，把两类“取消”稳定分开：
+//   - 调用方 ctx 已结束（主动取消 / 调用方自己的截止）：CodeCanceled，
+//     与设备侧行为无关，即使电源切换同时发生也以调用方行为为准；
+//   - 调用方 ctx 仍然存活、本次采样是被设备侧电源切换打断：按票据上
+//     记录的设备侧原因返回（挂起 => CodeSuspended，关电 => CodePoweredOff），
+//     结论只取决于“谁打断的”，不随内部 ctx 与总线读的调度先后变化；
+//   - 其余错误沿用统一归一化。
+func (h *HAL) mapSampleErr(caller context.Context, tok *inflightSample, err error) error {
+	mapped := mapErr("sample", err)
+	if caller.Err() != nil {
+		return mapped
+	}
+	if tok.abortCode != 0 {
+		de, ok := mapped.(*DeviceError)
+		if !ok {
+			de = &DeviceError{Op: "sample", Message: mapped.Error()}
+		}
+		de.Code = tok.abortCode
+		return de
+	}
+	return mapped
 }
 
 // Suspend 挂起设备（已挂起时为幂等无操作）。在途采样会被取消，
@@ -197,7 +238,7 @@ func (h *HAL) Read(ctx context.Context) (Sample, error) {
 func (h *HAL) Suspend(ctx context.Context) error {
 	h.pmu.Lock()
 	defer h.pmu.Unlock()
-	h.abortActive()
+	h.abortActive(CodeSuspended)
 	if h.drv.State() == sensor.StateSuspended {
 		return nil
 	}
@@ -215,7 +256,7 @@ func (h *HAL) Resume(ctx context.Context) error {
 func (h *HAL) Shutdown(ctx context.Context) error {
 	h.pmu.Lock()
 	defer h.pmu.Unlock()
-	h.abortActive()
+	h.abortActive(CodePoweredOff)
 	return mapErr("shutdown", h.drv.PowerOff(ctx))
 }
 

@@ -381,8 +381,10 @@ func TestObserverSuspendResumeKeepsHistory(t *testing.T) {
 	waitFor(t, 2*time.Second, func() bool { return len(o.RecentFailures(0)) >= 1 },
 		"failure recorded while suspended")
 	for _, f := range o.RecentFailures(0) {
-		if f.Code != CodeCanceled && f.Code != CodeSuspended {
-			t.Fatalf("suspend failure code = %s, want CANCELED/SUSPENDED", f.Code)
+		// 设备挂起导致的中断必须稳定归因为 SUSPENDED；
+		// 绝不能随调度时机误记成调用方主动结束 CANCELED。
+		if f.Code != CodeSuspended {
+			t.Fatalf("suspend failure code = %s (%s), want stable SUSPENDED", f.Code, f.Message)
 		}
 	}
 	// 挂起期间不会产生任何新采样（不返回陈旧数据）。
