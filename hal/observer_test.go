@@ -377,12 +377,17 @@ func TestObserverSuspendResumeKeepsHistory(t *testing.T) {
 	if err := h.Suspend(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	// 挂起期间流以终态错误结束、按 RestartWait 周期重建并记录失败，不空转。
-	waitFor(t, 2*time.Second, func() bool { return len(o.RecentFailures(0)) >= 1 },
+	// 挂起期间流以终态错误结束、按 RestartWait 周期重建并记录失败。
+	waitFor(t, 2*time.Second, func() bool { return len(o.RecentFailures(0)) >= 2 },
 		"failure recorded while suspended")
 	for _, f := range o.RecentFailures(0) {
-		if f.Code != CodeCanceled && f.Code != CodeSuspended {
-			t.Fatalf("suspend failure code = %s, want CANCELED/SUSPENDED", f.Code)
+		// 挂起是设备侧行为：失败归因必须稳定为 SUSPENDED，绝不能因调度
+		// 时机（取消恰好打断在途读 vs. 挂起后状态检查拒绝）飘成 CANCELED。
+		if f.Code != CodeSuspended {
+			t.Fatalf("suspend failure code = %s, want stably SUSPENDED", f.Code)
+		}
+		if f.Code == CodeCanceled {
+			t.Fatalf("device-side suspend misclassified as caller cancel: %+v", f)
 		}
 	}
 	// 挂起期间不会产生任何新采样（不返回陈旧数据）。
@@ -408,6 +413,168 @@ func TestObserverSuspendResumeKeepsHistory(t *testing.T) {
 		if all[i].Seq <= all[i-1].Seq {
 			t.Fatalf("frame seq order broken across resume: %d after %d",
 				all[i].Seq, all[i-1].Seq)
+		}
+	}
+}
+
+// TestObserverSuspendResumeAttributionStableAcrossCycles 反复执行挂起/恢复
+// 压测，断言设备侧中断的失败归因在所有轮次、所有调度时机下都稳定为
+// SUSPENDED，从不被误记成调用方主动结束的 CANCELED；同时覆盖触发边界：
+// 挂起期间不产新帧/不吐陈旧帧，恢复后帧序号严格接续，失败与最近采样可一起查。
+func TestObserverSuspendResumeAttributionStableAcrossCycles(t *testing.T) {
+	h, o := startObserver(t, 256, 256)
+	ctx := context.Background()
+
+	const cycles = 12
+	var prevLatest uint64
+	for c := 1; c <= cycles; c++ {
+		// 恢复后（首轮为启动后）等后台采到至少若干帧，让 Suspend 可能落在
+		// 采集过程的不同时刻：总线读在途、轮询休眠间隙、两帧之间等。
+		want := prevLatest + 3
+		waitFor(t, 2*time.Second, func() bool {
+			return o.Stats().LatestSampleSeq >= want
+		}, "pre-suspend samples cycle")
+		beforeSuspend := o.Stats().LatestSampleSeq
+
+		failsBefore := len(o.RecentFailures(0))
+		if err := h.Suspend(ctx); err != nil {
+			t.Fatalf("cycle %d suspend: %v", c, err)
+		}
+
+		// 保持挂起若干个重建周期：泵会反复建流、反复得到终态错误。
+		// 每一轮重建流时，挂起可能打断在途读（旧代码记 CANCELED），
+		// 也可能在状态检查处被拒（记 SUSPENDED）——归因必须一致。
+		time.Sleep(o.cfg.RestartWait*4 + 25*time.Millisecond)
+
+		failsDuring := o.RecentFailures(0)[failsBefore:]
+		if len(failsDuring) == 0 {
+			t.Fatalf("cycle %d: no failure recorded while suspended", c)
+		}
+		for _, f := range failsDuring {
+			if f.Code != CodeSuspended {
+				t.Fatalf("cycle %d unstable attribution: failure #%d code=%s (%s), "+
+					"want SUSPENDED for device-side suspend in every cycle",
+					c, f.Seq, f.Code, f.Message)
+			}
+			if f.Op != "sample" || f.T.IsZero() || f.Seq == 0 {
+				t.Fatalf("cycle %d incomplete failure record: %+v", c, f)
+			}
+		}
+		t.Logf("cycle %2d: suspended, %2d terminal failures all SUSPENDED "+
+			"(latest sample seq=%d frozen)", c, len(failsDuring), beforeSuspend)
+
+		// 触发边界 1：挂起期间绝不产生新采样，也不会吐出陈旧/乱序帧。
+		if seq := o.Stats().LatestSampleSeq; seq != beforeSuspend {
+			t.Fatalf("cycle %d: samples advanced while suspended: %d -> %d",
+				c, beforeSuspend, seq)
+		}
+		recent := o.Recent(0)
+		if len(recent) == 0 {
+			t.Fatalf("cycle %d: recent samples lost while suspended", c)
+		}
+		if recent[len(recent)-1].Seq != beforeSuspend {
+			t.Fatalf("cycle %d: stale/extra frame appeared in recent window", c)
+		}
+		// 失败记录与最近采样必须能一起查到（同一快照视角复盘）。
+		if st := o.Stats(); st.FailureCount != len(o.RecentFailures(0)) {
+			t.Fatalf("cycle %d: failure stats/snapshot disagree", c)
+		}
+
+		if err := h.Resume(ctx); err != nil {
+			t.Fatalf("cycle %d resume: %v", c, err)
+		}
+		// 触发边界 2：恢复后采样正常接续，序号严格大于挂起前最后一帧。
+		waitFor(t, 2*time.Second, func() bool {
+			return o.Stats().LatestSampleSeq > beforeSuspend
+		}, "samples resume after resume")
+		all := o.Recent(0)
+		for i := 1; i < len(all); i++ {
+			if all[i].Seq <= all[i-1].Seq {
+				t.Fatalf("cycle %d: seq order broken: %d after %d",
+					c, all[i].Seq, all[i-1].Seq)
+			}
+		}
+		if all[len(all)-1].Seq != o.Stats().LatestSampleSeq {
+			t.Fatalf("cycle %d: latest recent frame disagrees with stats", c)
+		}
+		prevLatest = o.Stats().LatestSampleSeq
+		t.Logf("cycle %2d: resumed, samples continued seq -> %d", c, prevLatest)
+	}
+
+	// 全程汇总：失败环里不允许出现任何一条 CANCELED——Close 尚未发生，
+	// 调用方从未取消自己的采集，所有设备侧中断都必须是 SUSPENDED。
+	for _, f := range o.RecentFailures(0) {
+		if f.Code == CodeCanceled {
+			t.Fatalf("device-side suspend interrupt misrecorded as caller cancel: %+v", f)
+		}
+	}
+}
+
+// TestObserverSuspendAttributionIndependentOfTiming 直接对 HAL.Read 做挂起
+// 压测：把挂起插入采样过程的不同时刻（在途总线读 / 就绪轮询等待 / 即将发读），
+// 反复多轮，结论必须轮轮相同且恒为 SUSPENDED；调用方主动取消则恒为 CANCELED。
+func TestObserverSuspendAttributionIndependentOfTiming(t *testing.T) {
+	h, mb, _ := newHAL(t)
+	ctx := context.Background()
+	if err := h.Open(ctx, sensor.Config{ODR: sensor.ODR400, FSR: sensor.FSR4}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 给状态寄存器读加一个可被取消打断的延迟，制造“取消恰好打断在途总线读”
+	// 的时机；每轮只生效一次，恢复清障后采样可正常完成。
+	const rounds = 25
+	for i := 0; i < rounds; i++ {
+		mb.AddFault(bus.FaultRule{
+			Kind: bus.OpRead, Addr: sensor.AddrStatus,
+			Fault: bus.FaultTimeout, Delay: 30 * time.Millisecond, Times: 1,
+		})
+		errCh := make(chan error, 1)
+		go func() {
+			_, e := h.Read(ctx)
+			errCh <- e
+		}()
+		// 在 [0,30ms) 内分散挂起点：早取消打断在途读，晚取消与读超时竞争。
+		// 结论不能因为这个早晚差异而改变。
+		time.Sleep(time.Duration(i%6) * 4 * time.Millisecond)
+		if err := h.Suspend(ctx); err != nil {
+			t.Fatalf("round %d suspend: %v", i, err)
+		}
+		select {
+		case err := <-errCh:
+			mustCode(t, err, CodeSuspended)
+		case <-time.After(time.Second):
+			t.Fatalf("round %d: in-flight read never returned", i)
+		}
+		mb.ClearFaults()
+		if err := h.Resume(ctx); err != nil {
+			t.Fatalf("round %d resume: %v", i, err)
+		}
+		// 恢复后下一轮前先确认采样恢复正常（不返回陈旧帧）。
+		if _, err := h.Read(ctx); err != nil {
+			t.Fatalf("round %d post-resume read: %v", i, err)
+		}
+	}
+	t.Logf("completed %d suspend-at-various-timing rounds, all SUSPENDED", rounds)
+
+	// 同一设备、同样的在途形态，由调用方取消时结论恒为 CANCELED。
+	mb.AddFault(bus.FaultRule{
+		Kind: bus.OpRead, Addr: sensor.AddrStatus,
+		Fault: bus.FaultTimeout, Delay: 100 * time.Millisecond,
+	})
+	for i := 0; i < 5; i++ {
+		cctx, cancel := context.WithCancel(ctx)
+		errCh := make(chan error, 1)
+		go func() {
+			_, e := h.Read(cctx)
+			errCh <- e
+		}()
+		time.Sleep(5 * time.Millisecond)
+		cancel()
+		select {
+		case err := <-errCh:
+			mustCode(t, err, CodeCanceled)
+		case <-time.After(time.Second):
+			t.Fatal("caller-canceled read never returned")
 		}
 	}
 }

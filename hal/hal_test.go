@@ -138,8 +138,27 @@ func TestSuspendIdempotentAndInFlightAbort(t *testing.T) {
 	// 状态寄存器每次事务阻塞 40ms 后超时：采样确定处于在途等待状态。
 	mb.AddFault(bus.FaultRule{Kind: bus.OpRead, Addr: sensor.AddrStatus, Fault: bus.FaultTimeout, Delay: 40 * time.Millisecond})
 
-	// 在途采样必须被挂起取消，Suspend 不应长时间阻塞。
+	// 对照基线：在途采样由调用方自己取消 ctx（设备仍 ACTIVE），
+	// 结论必须是 CANCELED。
+	ccctx, ccancel := context.WithCancel(ctx)
+	callerErr := make(chan error, 1)
+	go func() {
+		_, err := h.Read(ccctx)
+		callerErr <- err
+	}()
+	time.Sleep(5 * time.Millisecond) // 确保采样已在途
+	ccancel()
+	select {
+	case err := <-callerErr:
+		mustCode(t, err, CodeCanceled)
+	case <-time.After(time.Second):
+		t.Fatal("caller-canceled read never returned")
+	}
+
+	// 同样的在途采样，这次由设备侧挂起打断：在途采样必须被挂起取消，
+	// Suspend 不应长时间阻塞。
 	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	readErr := make(chan error, 1)
 	go func() {
 		_, err := h.Read(rctx)
@@ -154,10 +173,12 @@ func TestSuspendIdempotentAndInFlightAbort(t *testing.T) {
 	if d := time.Since(start); d > 250*time.Millisecond {
 		t.Fatalf("suspend blocked for %v while read in flight", d)
 	}
-	cancel()
 	select {
 	case err := <-readErr:
-		mustCode(t, err, CodeCanceled)
+		// 设备侧挂起打断在途采样：即使调用方 ctx 始终存活、即使取消恰好
+		// 打断了一次总线读（驱动报 KindCanceled），结论也必须是 SUSPENDED，
+		// 绝不能记成调用方主动结束的 CANCELED。
+		mustCode(t, err, CodeSuspended)
 	case <-time.After(time.Second):
 		t.Fatal("in-flight read never returned")
 	}
@@ -170,6 +191,36 @@ func TestSuspendIdempotentAndInFlightAbort(t *testing.T) {
 	if err := h.Resume(ctx); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestShutdownAbortsInFlightAsPoweredOff 验证关电与挂起同理：在途采样被
+// Shutdown 打断时结论恒为 POWERED_OFF（设备侧行为），不是调用方 CANCELED；
+// 之后新采样也立即得到 POWERED_OFF，结论不随时机变化。
+func TestShutdownAbortsInFlightAsPoweredOff(t *testing.T) {
+	h, mb, _ := newHAL(t)
+	ctx := context.Background()
+	if err := h.Open(ctx, sensor.Config{ODR: sensor.ODR100, FSR: sensor.FSR4}); err != nil {
+		t.Fatal(err)
+	}
+	mb.AddFault(bus.FaultRule{Kind: bus.OpRead, Addr: sensor.AddrStatus, Fault: bus.FaultTimeout, Delay: 40 * time.Millisecond})
+
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := h.Read(ctx)
+		readErr <- err
+	}()
+	time.Sleep(5 * time.Millisecond)
+	if err := h.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	select {
+	case err := <-readErr:
+		mustCode(t, err, CodePoweredOff)
+	case <-time.After(time.Second):
+		t.Fatal("in-flight read never returned")
+	}
+	_, err := h.Read(ctx)
+	mustCode(t, err, CodePoweredOff)
 }
 
 func TestConcurrentSamplesNoRace(t *testing.T) {
@@ -325,7 +376,9 @@ func TestStreamStopsOnSuspend(t *testing.T) {
 	case <-deadline:
 		t.Fatal("stream did not terminate on suspend")
 	}
-	mustCode(t, finalErr, CodeCanceled)
+	// 挂起是设备侧电源行为：在途那帧无论被取消打断在总线读上还是随后在
+	// 状态检查处立即拒绝，流收到的终态错误恒为 SUSPENDED，而不是 CANCELED。
+	mustCode(t, finalErr, CodeSuspended)
 	_, ok := <-ch
 	if ok {
 		t.Fatal("stream channel must close after terminal error")

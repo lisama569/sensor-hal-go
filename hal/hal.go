@@ -75,6 +75,15 @@ func (e *DeviceError) Error() string {
 	return s
 }
 
+// errAbortedBySuspend / errAbortedByShutdown 是电源切换主动取消在途采样时
+// 携带在采样上下文上的“取消原因”。它只用于把“设备侧电源行为打断采集”与
+// “调用方自己结束采集”明确分开，绝不向对外错误暴露：最终结论统一归一化为
+// CodeSuspended / CodePoweredOff，而不是 CodeCanceled。
+var (
+	errAbortedBySuspend  = errors.New("hal: in-flight sample aborted by suspend")
+	errAbortedByShutdown = errors.New("hal: in-flight sample aborted by shutdown")
+)
+
 // Sample 是对外采样结果（复用驱动层带时间/质量标记的结构）。
 type Sample = sensor.Sample
 
@@ -102,7 +111,7 @@ type HAL struct {
 	sampleGate chan struct{}
 
 	mu           sync.Mutex
-	activeCancel context.CancelFunc
+	activeCancel context.CancelCauseFunc
 }
 
 // New 基于已构造的驱动创建 HAL。
@@ -125,9 +134,10 @@ func (h *HAL) acquireSample(ctx context.Context) error {
 
 func (h *HAL) releaseSample() { <-h.sampleGate }
 
-// registerActive 登记一个可被电源切换取消的采样上下文，返回其 cancel。
-func (h *HAL) registerActive() (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
+// registerActive 登记一个可被电源切换取消的采样上下文，返回其 ctx 与
+// 带原因的 cancel。
+func (h *HAL) registerActive() (context.Context, context.CancelCauseFunc) {
+	ctx, cancel := context.WithCancelCause(context.Background())
 	h.mu.Lock()
 	h.activeCancel = cancel
 	h.mu.Unlock()
@@ -135,24 +145,25 @@ func (h *HAL) registerActive() (context.Context, context.CancelFunc) {
 }
 
 // clearActive 注销（仅当登记的仍是自己）并取消上下文。
-func (h *HAL) clearActive(cancel context.CancelFunc) {
+func (h *HAL) clearActive(cancel context.CancelCauseFunc) {
 	h.mu.Lock()
 	if h.activeCancel != nil {
 		// 无法比较函数指针身份时也只需清空：后来者会覆盖此字段。
 		h.activeCancel = nil
 	}
 	h.mu.Unlock()
-	cancel()
+	cancel(nil)
 }
 
-// abortActive 取消在途采样（若有）。
-func (h *HAL) abortActive() {
+// abortActive 因电源切换（挂起/关电）取消在途采样（若有），并在该采样
+// 上下文上携带设备侧原因，使被打断的采样结论可与调用方取消区分。
+func (h *HAL) abortActive(cause error) {
 	h.mu.Lock()
 	c := h.activeCancel
 	h.activeCancel = nil
 	h.mu.Unlock()
 	if c != nil {
-		c()
+		c(cause)
 	}
 }
 
@@ -187,9 +198,48 @@ func (h *HAL) Read(ctx context.Context) (Sample, error) {
 
 	s, err := h.drv.Sample(cctx)
 	if err != nil {
-		return Sample{}, mapErr("sample", err)
+		return Sample{}, h.mapSampleErr(ctx, active, err)
 	}
 	return s, nil
+}
+
+// mapSampleErr 归一化一次采样的终态错误，关键是把“谁打断了这次采样”
+// 稳定地区分开，结论不随调度先后或取消与总线事务谁先谁后而变化：
+//
+//   - 调用方 ctx 已结束（主动取消 / 调用方自己的截止到期）：CodeCanceled，
+//     即使此刻电源切换也恰好发生，仍以调用方意图为准；
+//   - 调用方 ctx 存活、但在途采样是被 Suspend 取消的：无论驱动此时报上来的是
+//     KindCanceled（取消恰好打断总线读/轮询休眠）还是 KindSuspended
+//     （采样走到状态检查时设备已挂起），结论恒为 CodeSuspended；
+//   - 同理，被 Shutdown 取消恒为 CodePoweredOff；
+//   - 其余错误沿用 mapErr 的归一化结果。
+func (h *HAL) mapSampleErr(caller, active context.Context, err error) error {
+	mapped := mapErr("sample", err)
+	if caller.Err() != nil {
+		return mapped
+	}
+	switch context.Cause(active) {
+	case errAbortedBySuspend:
+		return recode(mapped, CodeSuspended, "sample aborted by device suspend")
+	case errAbortedByShutdown:
+		return recode(mapped, CodePoweredOff, "sample aborted by device shutdown")
+	default:
+		return mapped
+	}
+}
+
+// recode 在保留原错误操作名/尝试次数等留痕的前提下替换归一化错误码与说明。
+func recode(err error, code Code, msg string) error {
+	var de *DeviceError
+	if !errors.As(err, &de) {
+		return &DeviceError{Code: code, Op: "sample", Message: msg}
+	}
+	cp := *de
+	cp.Code = code
+	if msg != "" {
+		cp.Message = msg
+	}
+	return &cp
 }
 
 // Suspend 挂起设备（已挂起时为幂等无操作）。在途采样会被取消，
@@ -197,7 +247,7 @@ func (h *HAL) Read(ctx context.Context) (Sample, error) {
 func (h *HAL) Suspend(ctx context.Context) error {
 	h.pmu.Lock()
 	defer h.pmu.Unlock()
-	h.abortActive()
+	h.abortActive(errAbortedBySuspend)
 	if h.drv.State() == sensor.StateSuspended {
 		return nil
 	}
@@ -215,7 +265,7 @@ func (h *HAL) Resume(ctx context.Context) error {
 func (h *HAL) Shutdown(ctx context.Context) error {
 	h.pmu.Lock()
 	defer h.pmu.Unlock()
-	h.abortActive()
+	h.abortActive(errAbortedByShutdown)
 	return mapErr("shutdown", h.drv.PowerOff(ctx))
 }
 
@@ -246,6 +296,8 @@ func (h *HAL) Stream(ctx context.Context) <-chan StreamItem {
 					return
 				}
 				// 挂起/掉电/不兼容等终态不再空转：交由调用方恢复后重新建流。
+				// 挂起/关电打断在途采样时，err 已在 Read 内按设备侧取消原因
+				// 归一化为 CodeSuspended/CodePoweredOff，不会是 CodeCanceled。
 				return
 			}
 			select {

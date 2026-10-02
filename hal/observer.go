@@ -175,7 +175,9 @@ func (o *Observer) run() {
 		for item := range ch {
 			if item.Err != nil {
 				// Stream 因自身 ctx 结束而退出（Close/启动 ctx 取消）：
-				// 这是调用方主动结束采集，不作为设备失败记录。
+				// 这是调用方主动结束采集，不作为设备失败记录。设备侧挂起/
+				// 关电不会走到这里——它们的 ctx（o.ctx）仍然存活，错误为
+				// SUSPENDED/POWERED_OFF，应落入失败环。
 				if o.ctx.Err() != nil {
 					return
 				}
@@ -210,8 +212,10 @@ func (o *Observer) recordSample(s Sample) {
 
 // recordFailure 把一次采集失败归一化后追加进定容环。
 // 错误码直接沿用 HAL 的归一化结论：同一设备/总线行为在任何调度时机
-// 得到同一 Code；设备等待窗口超时（TIMEOUT）与调用方主动结束（CANCELED）
-// 在此天然可分。
+// 得到同一 Code；设备等待窗口超时（TIMEOUT）、设备挂起打断采集
+// （SUSPENDED）与调用方主动结束（CANCELED）三者天然可分——挂起打断在途
+// 采样时 HAL 已按电源侧取消原因校正为 SUSPENDED，不会因为 ctx 被取消而
+// 误记成 CANCELED。
 func (o *Observer) recordFailure(err error) {
 	rec := FailureRecord{T: o.now(), Code: CodeInternal, Message: err.Error()}
 	var de *DeviceError
